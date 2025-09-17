@@ -1,8 +1,6 @@
 # Support for a peltier heater/cooler
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-from .output_pin import GCodeRequestQueue
-from heaters import Heater
 
 
 KELVIN_TO_CELSIUS = -273.15
@@ -32,20 +30,33 @@ class PrinterPeltier:
             self.relay_pin = ppins.setup_pin('digital_out', relay_pin_name)
             self.relay_pin.setup_max_duration(0.0)  # No duration for digital out
             self.relay_pin.setup_start_value(0, 0)  # Default to low (cooling mode)
-            self.relay_gcrq = GCodeRequestQueue(config, self.relay_pin.get_mcu(), self._set_relay_pin)
         self.last_relay_state = -1  # Initialize to an invalid state
         self.polarity_hysteresis = config.getfloat('polarity_hysteresis', 1.0, minval=0.1)
 
         # Override the heater's control with our custom Peltier PID control
         # We need to pass the relay pin and hysteresis to the control algorithm
-        old_control = self.heater.get_control()
+        profile = self.heater.get_control().get_profile()
         self.heater.set_control(ControlPeltierPID(
-            old_control.get_profile(), self.heater,
+            profile, self.heater,
             relay_pin=self.relay_pin,
-            relay_gcrq=self.relay_gcrq,
             last_relay_state=self.last_relay_state,
             polarity_hysteresis=self.polarity_hysteresis
         ))
+
+        self.printer.register_event_handler(
+            "klippy:shutdown", self._handle_shutdown
+        )
+
+    def _set_relay_pin(self, print_time, value):
+        if value == self.last_relay_state:
+            return "discard", 0.0
+        self.last_relay_state = value
+        self.relay_pin.set_digital(print_time, value)
+
+    def _handle_shutdown(self):
+        self.verify_mainthread_time = -999.0
+        if self.relay_pin:
+            self.relay_pin.set_digital(self.printer.get_reactor().monotonic(), 0) # Ensure relay is off on shutdown
 
 
 ######################################################################
@@ -58,15 +69,15 @@ PID_SETTLE_SLOPE = 0.1
 
 class ControlPeltierPID:
     def __init__(self, profile, heater, load_clean=False,
-                 relay_pin=None, relay_gcrq=None, last_relay_state=-1,
+                 relay_pin=None, last_relay_state=-1,
                  polarity_hysteresis=1.0):
         self.profile = profile
         self.heater = heater
         self.heater_max_power = heater.get_max_power()
         self.relay_pin = relay_pin
-        self.relay_gcrq = relay_gcrq
         self.last_relay_state = last_relay_state
         self.polarity_hysteresis = polarity_hysteresis
+        self.cooling_mode = True
         self.Kp = profile["pid_kp"] / PID_PARAM_BASE
         self.Ki = profile["pid_ki"] / PID_PARAM_BASE
         self.Kd = profile["pid_kd"] / PID_PARAM_BASE
@@ -91,7 +102,13 @@ class ControlPeltierPID:
     def temperature_update(self, read_time, temp, target_temp):
         time_diff = read_time - self.prev_temp_time
         # Calculate change of temperature
-        temp_diff = temp - self.prev_temp
+        if self.cooling_mode:
+            temp_diff = - temp + self.prev_temp
+            temp_err = - target_temp + temp
+        else:
+            temp_diff = temp - self.prev_temp
+            temp_err = target_temp - temp
+
         if time_diff >= self.min_deriv_time:
             temp_deriv = temp_diff / time_diff
         else:
@@ -100,9 +117,8 @@ class ControlPeltierPID:
                 + temp_diff
             ) / self.min_deriv_time
         # Calculate accumulated temperature "error"
-        temp_err = target_temp - temp
         temp_integ = self.prev_temp_integ + temp_err * time_diff
-        temp_integ = max(0.0, min(self.temp_integ_max, temp_integ))
+        temp_integ = max(- self.temp_integ_max, min(self.temp_integ_max, temp_integ))
         # Calculate output
         co = self.Kp * temp_err + self.Ki * temp_integ - self.Kd * temp_deriv
         # logging.debug("pid: %f@%.3f -> diff=%f deriv=%f err=%f integ=%f co=%d",
@@ -113,8 +129,16 @@ class ControlPeltierPID:
         self.prev_temp = temp
         self.prev_temp_time = read_time
         self.prev_temp_deriv = temp_deriv
-        if co == bounded_co:
-            self.prev_temp_integ = temp_integ
+
+        if target_temp - temp > self.polarity_hysteresis:
+            self.cooling_mode = 0
+        if target_temp - temp < - self.polarity_hysteresis:
+            self.cooling_mode = 1
+        if self.relay_pin:
+            relay_state = 0 if self.cooling_mode else 1
+            if relay_state != self.last_relay_state:
+                self.relay_pin.set_digital(read_time, relay_state)
+                self.last_relay_state = relay_state
 
     def check_busy(self, eventtime, smoothed_temp, target_temp):
         temp_diff = target_temp - smoothed_temp
