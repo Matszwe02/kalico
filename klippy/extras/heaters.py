@@ -1032,9 +1032,9 @@ class ControlPeltierPID:
         self.prev_temp_deriv = temp_deriv
         if co == bounded_co:
             self.prev_temp_integ = temp_integ
-        if target_temp and target_temp - temp > self.polarity_hysteresis:
+        if target_temp and target_temp - temp > self.polarity_hysteresis and bounded_co < 0.01:
             self.cooling_mode = 0
-        if target_temp and target_temp - temp < - self.polarity_hysteresis:
+        if target_temp and target_temp - temp < - self.polarity_hysteresis and bounded_co < 0.01:
             self.cooling_mode = 1
         if self.relay_pin:
             relay_state = self.cooling_mode
