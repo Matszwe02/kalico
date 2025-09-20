@@ -90,6 +90,14 @@ class Heater:
         )
         self.mcu_pwm.setup_cycle_time(pwm_cycle_time)
         self.mcu_pwm.setup_max_duration(MAX_HEAT_TIME)
+        self.relay_pin = None
+        relay_pin_name = config.get('relay_pin', None)
+        if relay_pin_name:
+            self.relay_pin = ppins.setup_pin('digital_out', relay_pin_name)
+            self.relay_pin.setup_max_duration(0.0)
+            self.relay_pin.setup_start_value(0, 0)
+        self.last_relay_state = -1  # Initialize to an invalid state
+        self.polarity_hysteresis = config.getfloat('polarity_hysteresis', 1.0, minval=0.1)
         # Load additional modules
         self.printer.load_object(config, "verify_heater %s" % (short_name,))
         self.printer.load_object(config, "pid_calibrate")
@@ -136,6 +144,7 @@ class Heater:
             {
                 "watermark": ControlBangBang,
                 "pid": ControlPID,
+                "peltier_pid": ControlPeltierPID,
                 "pid_v": ControlVelocityPID,
                 "mpc": ControlMPC,
             }
@@ -172,6 +181,8 @@ class Heater:
 
     def _handle_shutdown(self):
         self.verify_mainthread_time = -999.0
+        if self.relay_pin:
+            self.relay_pin.set_digital(self.printer.get_reactor().monotonic(), 0)
 
     # External commands
     def get_name(self):
@@ -293,8 +304,8 @@ class Heater:
     cmd_SET_HEATER_PID_help = "Sets a heater PID parameter"
 
     def cmd_SET_HEATER_PID(self, gcmd):
-        if not isinstance(self.control, (ControlPID, ControlVelocityPID)):
-            raise gcmd.error("Not a PID/PID_V controlled heater")
+        if not isinstance(self.control, (ControlPID, ControlPeltierPID, ControlVelocityPID)):
+            raise gcmd.error("Not a PID/Peltier_PID/PID_V controlled heater")
         kp = gcmd.get_float("KP", None)
         if kp is not None:
             self.control.Kp = kp / PID_PARAM_BASE
@@ -446,7 +457,7 @@ class Heater:
                 temp_profile["fan_ambient_transfer"] = (
                     config_section.getfloatlist("fan_ambient_transfer", [])
                 )
-            elif control == "pid" or control == "pid_v":
+            elif control == "pid" or control == "pid_v" or control == "peltier_pid":
                 for key, (type, placeholder) in PID_PROFILE_OPTIONS.items():
                     can_be_none = (
                         key != "pid_kp" and key != "pid_ki" and key != "pid_kd"
@@ -953,6 +964,99 @@ class ControlVelocityPID:
 
     def get_type(self):
         return "pid_v"
+
+
+######################################################################
+# Polarity Proportional Integral Derivative (PID) control algo
+######################################################################
+
+
+class ControlPeltierPID:
+    def __init__(self, profile, heater, load_clean=False):
+        self.profile = profile
+        self.heater = heater
+        self.relay_pin = heater.relay_pin
+        self.last_relay_state = heater.last_relay_state
+        self.polarity_hysteresis = heater.polarity_hysteresis
+        self.cooling_mode = False
+        self.heater_max_power = heater.get_max_power()
+        self.Kp = profile["pid_kp"] / PID_PARAM_BASE
+        self.Ki = profile["pid_ki"] / PID_PARAM_BASE
+        self.Kd = profile["pid_kd"] / PID_PARAM_BASE
+        self.min_deriv_time = (
+            self.heater.get_smooth_time()
+            if profile["smooth_time"] is None
+            else profile["smooth_time"]
+        )
+        self.heater.set_inv_smooth_time(1.0 / self.min_deriv_time)
+        self.temp_integ_max = 0.0
+        if self.Ki:
+            self.temp_integ_max = self.heater_max_power / self.Ki
+        self.prev_temp = (
+            AMBIENT_TEMP
+            if load_clean
+            else self.heater.get_temp(self.heater.reactor.monotonic())[0]
+        )
+        self.prev_temp_time = 0.0
+        self.prev_temp_deriv = 0.0
+        self.prev_temp_integ = 0.0
+
+    def temperature_update(self, read_time, temp, target_temp):
+        time_diff = read_time - self.prev_temp_time
+        # Calculate change of temperature
+        if self.cooling_mode:
+            temp_diff = - temp + self.prev_temp
+            temp_err = - target_temp + temp
+        else:
+            temp_diff = temp - self.prev_temp
+            temp_err = target_temp - temp
+        if time_diff >= self.min_deriv_time:
+            temp_deriv = temp_diff / time_diff
+        else:
+            temp_deriv = (
+                self.prev_temp_deriv * (self.min_deriv_time - time_diff)
+                + temp_diff
+            ) / self.min_deriv_time
+        # Calculate accumulated temperature "error"
+        temp_integ = self.prev_temp_integ + temp_err * time_diff
+        temp_integ = max(0.0, min(self.temp_integ_max, temp_integ))
+        # Calculate output
+        co = self.Kp * temp_err + self.Ki * temp_integ - self.Kd * temp_deriv
+        # logging.debug("pid: %f@%.3f -> diff=%f deriv=%f err=%f integ=%f co=%d",
+        #    temp, read_time, temp_diff, temp_deriv, temp_err, temp_integ, co)
+        bounded_co = max(0.0, min(self.heater_max_power, co))
+        self.heater.set_pwm(read_time, bounded_co)
+        # Store state for next measurement
+        self.prev_temp = temp
+        self.prev_temp_time = read_time
+        self.prev_temp_deriv = temp_deriv
+        if co == bounded_co:
+            self.prev_temp_integ = temp_integ
+        if target_temp and target_temp - temp > self.polarity_hysteresis:
+            self.cooling_mode = 0
+        if target_temp and target_temp - temp < - self.polarity_hysteresis:
+            self.cooling_mode = 1
+        if self.relay_pin:
+            relay_state = self.cooling_mode
+            if relay_state != self.last_relay_state:
+                self.relay_pin.set_digital(read_time, relay_state)
+                self.last_relay_state = relay_state
+
+    def check_busy(self, eventtime, smoothed_temp, target_temp):
+        temp_diff = target_temp - smoothed_temp
+        return (
+            abs(temp_diff) > PID_SETTLE_DELTA
+            or abs(self.prev_temp_deriv) > PID_SETTLE_SLOPE
+        )
+
+    def update_smooth_time(self):
+        self.smooth_time = self.heater.get_smooth_time()  # smoothing window
+
+    def get_profile(self):
+        return self.profile
+
+    def get_type(self):
+        return "peltier_pid"
 
 
 ######################################################################
